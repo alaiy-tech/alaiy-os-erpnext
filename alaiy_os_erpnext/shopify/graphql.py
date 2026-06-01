@@ -1,6 +1,6 @@
 """
 Shopify Admin GraphQL API client for alaiy OS ERPNext.
-Credentials read from the Frappe "Shopify Settings" Single DocType.
+Credentials read from site_config.json (frappe.conf).
 
 API version: 2025-01
 Rate limiting: bucket-based (cost tracking) with exponential backoff.
@@ -15,13 +15,13 @@ class ShopifyGraphQL:
     API_VERSION = "2025-01"
 
     def __init__(self):
-        settings = frappe.get_single("Shopify Settings")
-        shop = getattr(settings, "shopify_url", "") or getattr(settings, "shop", "")
+        conf = frappe.conf
+        shop = getattr(conf, "shopify_domain", "")
         shop = shop.replace("https://", "").replace("http://", "").rstrip("/")
         if not shop.endswith(".myshopify.com"):
             shop = f"{shop}.myshopify.com"
         self.endpoint = f"https://{shop}/admin/api/{self.API_VERSION}/graphql.json"
-        self.token = settings.password or getattr(settings, "access_token", "")
+        self.token = getattr(conf, "shopify_access_token", "")
         self.session = requests.Session()
         self.session.headers.update({
             "X-Shopify-Access-Token": self.token,
@@ -260,7 +260,7 @@ class ShopifyGraphQL:
         return isq.get("inventoryAdjustmentGroup", {})
 
     def update_variant_price(self, product_id, variant_id, price, compare_at_price=None):
-        """Update price on a product variant using productVariantsBulkUpdate."""
+        """Update price on a product variant."""
         gql = """
         mutation ProductVariantsBulkUpdate(
           $productId: ID!
@@ -303,23 +303,6 @@ class ShopifyGraphQL:
             raise Exception(f"Return approve errors: {errors}")
         return rar.get("return", {})
 
-    def decline_return(self, return_id):
-        """Decline a return request."""
-        gql = """
-        mutation ReturnDeclineRequest($input: ReturnDeclineRequestInput!) {
-          returnDeclineRequest(input: $input) {
-            return { id status }
-            userErrors { field message }
-          }
-        }
-        """
-        result = self.query(gql, {"input": {"id": return_id}})
-        rdr = result.get("returnDeclineRequest", {})
-        errors = rdr.get("userErrors", [])
-        if errors:
-            raise Exception(f"Return decline errors: {errors}")
-        return rdr.get("return", {})
-
     def refund_return(self, return_id, line_items=None):
         """Issue a refund for a return."""
         gql = """
@@ -343,6 +326,23 @@ class ShopifyGraphQL:
         if errors:
             raise Exception(f"Return refund errors: {errors}")
         return rr.get("refund", {})
+
+    def get_products(self, limit=50):
+        """Return list of products."""
+        gql = """
+        query GetProducts($limit: Int!) {
+          products(first: $limit) {
+            nodes {
+              id title vendor status totalInventory
+              variants(first: 10) {
+                nodes { id sku price compareAtPrice inventoryQuantity }
+              }
+            }
+          }
+        }
+        """
+        data = self.query(gql, {"limit": limit})
+        return data.get("products", {}).get("nodes", [])
 
     def create_product(self, title, description="", vendor="", tags=None, status="ACTIVE"):
         """Create a new product."""
@@ -387,20 +387,3 @@ class ShopifyGraphQL:
         if errors:
             raise Exception(f"Product update errors: {errors}")
         return pu.get("product", {})
-
-    def get_products(self, limit=50):
-        """Return list of products."""
-        gql = """
-        query GetProducts($limit: Int!) {
-          products(first: $limit) {
-            nodes {
-              id title vendor status totalInventory
-              variants(first: 10) {
-                nodes { id sku price compareAtPrice inventoryQuantity }
-              }
-            }
-          }
-        }
-        """
-        data = self.query(gql, {"limit": limit})
-        return data.get("products", {}).get("nodes", [])

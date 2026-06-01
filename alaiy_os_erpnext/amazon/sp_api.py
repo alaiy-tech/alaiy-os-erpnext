@@ -1,7 +1,7 @@
 """
 Amazon SP API wrapper for alaiy OS ERPNext.
 Uses python-amazon-sp-api (pip install python-amazon-sp-api).
-Credentials are read from the "Amazon SP API Settings" Single DocType.
+Credentials are read from site_config.json (frappe.conf).
 """
 import frappe
 import json
@@ -9,16 +9,24 @@ from datetime import datetime, timedelta
 
 
 def get_sp_client():
-    """Instantiate AlaiyAmazonSP from ERPNext settings."""
-    settings = frappe.get_single("Amazon SP API Settings")
+    """Instantiate AlaiyAmazonSP from site_config.json credentials."""
+    conf = frappe.conf
     return AlaiyAmazonSP(
-        refresh_token=settings.refresh_token,
-        lwa_client_id=settings.client_id,
-        lwa_client_secret=settings.client_secret,
-        aws_access_key=settings.aws_access_key,
-        aws_secret_key=settings.aws_secret_key,
-        role_arn=settings.iam_arn,
+        refresh_token=conf.sp_api_refresh_token,
+        lwa_client_id=conf.sp_api_client_id,
+        lwa_client_secret=conf.sp_api_client_secret,
+        seller_id=getattr(conf, "sp_api_seller_id", ""),
+        marketplace_id=getattr(conf, "sp_api_marketplace_id", "A21TJRUUN4KGV"),
+        region=getattr(conf, "sp_api_region", "eu"),
     )
+
+
+def get_seller_id():
+    return getattr(frappe.conf, "sp_api_seller_id", "")
+
+
+def get_marketplace_id():
+    return getattr(frappe.conf, "sp_api_marketplace_id", "A21TJRUUN4KGV")
 
 
 class AlaiyAmazonSP:
@@ -29,44 +37,46 @@ class AlaiyAmazonSP:
     """
 
     def __init__(self, refresh_token, lwa_client_id, lwa_client_secret,
-                 aws_access_key, aws_secret_key, role_arn):
+                 seller_id="", marketplace_id="A21TJRUUN4KGV", region="eu"):
+        self.seller_id = seller_id
+        self.marketplace_id = marketplace_id
+        self.region = region
         self.credentials = {
             "refresh_token": refresh_token,
             "lwa_app_id": lwa_client_id,
             "lwa_client_secret": lwa_client_secret,
-            "aws_access_key": aws_access_key,
-            "aws_secret_key": aws_secret_key,
-            "role_arn": role_arn,
         }
+
+    def _marketplace_enum(self):
+        from sp_api.base import Marketplaces
+        marketplace_map = {
+            "A21TJRUUN4KGV": Marketplaces.IN,
+            "ATVPDKIKX0DER": Marketplaces.US,
+            "A1F83G8C2ARO7P": Marketplaces.UK,
+            "A1PA6795UKMFR9": Marketplaces.DE,
+            "APJ6JRA9NG5V4":  Marketplaces.IT,
+        }
+        return marketplace_map.get(self.marketplace_id, Marketplaces.IN)
 
     def _orders_api(self):
         from sp_api.api import Orders
-        from sp_api.base import Marketplaces
-        return Orders(credentials=self.credentials, marketplace=Marketplaces.IN)
-
-    def _catalog_api(self):
-        from sp_api.api import CatalogItems
-        from sp_api.base import Marketplaces
-        return CatalogItems(credentials=self.credentials, marketplace=Marketplaces.IN)
+        return Orders(credentials=self.credentials, marketplace=self._marketplace_enum())
 
     def _listings_api(self):
         from sp_api.api import ListingsItems
-        from sp_api.base import Marketplaces
-        return ListingsItems(credentials=self.credentials, marketplace=Marketplaces.IN)
+        return ListingsItems(credentials=self.credentials, marketplace=self._marketplace_enum())
 
     def _product_pricing_api(self):
         from sp_api.api import ProductPricing
-        from sp_api.base import Marketplaces
-        return ProductPricing(credentials=self.credentials, marketplace=Marketplaces.IN)
+        return ProductPricing(credentials=self.credentials, marketplace=self._marketplace_enum())
 
     def _feeds_api(self):
         from sp_api.api import Feeds
-        from sp_api.base import Marketplaces
-        return Feeds(credentials=self.credentials, marketplace=Marketplaces.IN)
+        return Feeds(credentials=self.credentials, marketplace=self._marketplace_enum())
 
     # ── Orders ────────────────────────────────────────────────────────────────
 
-    def get_orders(self, days_ago=1, marketplace_id="A21TJRUUN4KGV"):
+    def get_orders(self, days_ago=1):
         """Return list of order dicts created in the last `days_ago` days."""
         created_after = (datetime.utcnow() - timedelta(days=days_ago)).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
@@ -74,7 +84,7 @@ class AlaiyAmazonSP:
         api = self._orders_api()
         response = api.get_orders(
             CreatedAfter=created_after,
-            MarketplaceIds=[marketplace_id],
+            MarketplaceIds=[self.marketplace_id],
         )
         orders = response.payload.get("Orders", [])
         result = []
@@ -112,39 +122,44 @@ class AlaiyAmazonSP:
 
     # ── Account Health ────────────────────────────────────────────────────────
 
-    def get_account_health(self, marketplace_id="A21TJRUUN4KGV"):
+    def get_account_health(self):
         """
         Return account health metrics dict.
-        Keys: odr, late_shipment_rate, cancel_rate, valid_tracking_rate, a_to_z_claims
+        Amazon SP API v2 does not expose account health scores via a public endpoint.
+        We verify the connection using get_marketplace_participation and return
+        marketplace status. Full health metrics (ODR, etc.) require Seller Central UI
+        or DataKiosk/Reports API integration (coming in Phase 2).
         """
         try:
             from sp_api.api import Sellers
             api = Sellers(credentials=self.credentials)
-            response = api.get_account_health()
+            response = api.get_marketplace_participation()
             payload = response.payload or {}
-            metrics_list = payload.get("accountHealthRating", {}).get("metrics", [])
-            metrics = {}
-            for m in metrics_list:
-                name = m.get("name", "")
-                value = m.get("value", 0)
-                if "defect" in name.lower():
-                    metrics["odr"] = float(value)
-                elif "late" in name.lower():
-                    metrics["late_shipment_rate"] = float(value)
-                elif "cancel" in name.lower():
-                    metrics["cancel_rate"] = float(value)
-                elif "tracking" in name.lower():
-                    metrics["valid_tracking_rate"] = float(value)
-                elif "claim" in name.lower():
-                    metrics["a_to_z_claims"] = int(value)
-            return {"metrics": metrics, "raw": payload}
+            participations = payload.get("payload", payload) if isinstance(payload, dict) else payload
+            # Build a minimal health snapshot showing marketplace status
+            metrics = {
+                "connected": True,
+                "seller_id": self.seller_id,
+                "marketplace_id": self.marketplace_id,
+            }
+            # Extract marketplace status if available
+            if isinstance(participations, list):
+                for p in participations:
+                    mkt = p.get("marketplace", {})
+                    if mkt.get("id") == self.marketplace_id:
+                        metrics["marketplace_name"] = mkt.get("name", "Amazon India")
+                        metrics["marketplace_country"] = mkt.get("countryCode", "IN")
+                        part = p.get("participation", {})
+                        metrics["is_participating"] = part.get("isParticipating", True)
+                        break
+            return {"metrics": metrics, "note": "Full health scores (ODR, LSR) available via Seller Central or DataKiosk API."}
         except Exception as e:
-            frappe.log_error(f"SP API account health error: {e}", "SP API")
-            return {"metrics": {}, "error": str(e)}
+            frappe.log_error(f"SP API health check error: {e}", "SP API")
+            return {"metrics": {}, "connected": False, "error": str(e)}
 
     # ── Competitive Pricing ───────────────────────────────────────────────────
 
-    def get_competitive_pricing(self, asin_list, marketplace_id="A21TJRUUN4KGV"):
+    def get_competitive_pricing(self, asin_list):
         """Return dict of ASIN -> {lowest_price, buybox_price}."""
         api = self._product_pricing_api()
         result = {}
@@ -152,7 +167,7 @@ class AlaiyAmazonSP:
             batch = asin_list[i:i + 20]
             try:
                 response = api.get_competitive_pricing_for_asins(
-                    MarketplaceId=marketplace_id, Asins=batch
+                    MarketplaceId=self.marketplace_id, Asins=batch
                 )
                 for item in response.payload:
                     asin = item.get("ASIN")
@@ -177,17 +192,16 @@ class AlaiyAmazonSP:
 
     # ── Listings / Repricing ──────────────────────────────────────────────────
 
-    def reprice_listing(self, sku, price, marketplace_id="A21TJRUUN4KGV"):
+    def reprice_listing(self, sku, price):
         """Patch a listings item price via patchListingsItem."""
         api = self._listings_api()
-        seller_id = frappe.db.get_single_value("Amazon SP API Settings", "seller_id") or ""
         patches = [
             {
                 "op": "replace",
                 "path": "/attributes/purchasable_offer",
                 "value": [
                     {
-                        "marketplace_id": marketplace_id,
+                        "marketplace_id": self.marketplace_id,
                         "currency": "INR",
                         "our_price": [{"schedule": [{"value_with_tax": price}]}],
                     }
@@ -196,9 +210,9 @@ class AlaiyAmazonSP:
         ]
         try:
             response = api.patch_listings_item(
-                sellerId=seller_id,
+                sellerId=self.seller_id,
                 sku=sku,
-                marketplaceIds=[marketplace_id],
+                marketplaceIds=[self.marketplace_id],
                 body={"productType": "PRODUCT", "patches": patches},
             )
             return {"status": response.payload.get("status"), "sku": sku, "price": price}
@@ -206,15 +220,14 @@ class AlaiyAmazonSP:
             frappe.log_error(f"Reprice error for SKU {sku}: {e}", "SP API")
             return {"error": str(e), "sku": sku}
 
-    def get_listings_item(self, sku, marketplace_id="A21TJRUUN4KGV"):
+    def get_listings_item(self, sku):
         """Get full listing details for a SKU."""
         api = self._listings_api()
-        seller_id = frappe.db.get_single_value("Amazon SP API Settings", "seller_id") or ""
         try:
             response = api.get_listings_item(
-                sellerId=seller_id,
+                sellerId=self.seller_id,
                 sku=sku,
-                marketplaceIds=[marketplace_id],
+                marketplaceIds=[self.marketplace_id],
                 includedData=["summaries", "attributes", "issues", "offers"],
             )
             return response.payload
@@ -222,48 +235,25 @@ class AlaiyAmazonSP:
             frappe.log_error(f"Get listing error for SKU {sku}: {e}", "SP API")
             return {"error": str(e)}
 
-    def create_or_update_listing(self, sku, product_data, marketplace_id="A21TJRUUN4KGV"):
-        """Create or update a listing via putListingsItem."""
-        api = self._listings_api()
-        seller_id = frappe.db.get_single_value("Amazon SP API Settings", "seller_id") or ""
-        try:
-            response = api.put_listings_item(
-                sellerId=seller_id,
-                sku=sku,
-                marketplaceIds=[marketplace_id],
-                body=product_data,
-            )
-            return response.payload
-        except Exception as e:
-            frappe.log_error(f"Create/update listing error for SKU {sku}: {e}", "SP API")
-            return {"error": str(e)}
-
     # ── Inventory ─────────────────────────────────────────────────────────────
 
-    def update_inventory_quantity(self, sku, qty, marketplace_id="A21TJRUUN4KGV"):
-        """Update FBA inventory quantity via Feeds API (inventory feed)."""
+    def update_inventory_quantity(self, sku, qty):
+        """Update FBM inventory quantity via Feeds API."""
         api = self._feeds_api()
         feed_content = "sku\tquantity\n" + f"{sku}\t{int(qty)}\n"
         try:
+            import requests as req
             doc_response = api.create_feed_document(contentType="text/tab-separated-values;charset=UTF-8")
             doc = doc_response.payload
             feed_doc_id = doc["feedDocumentId"]
             upload_url = doc["url"]
-
-            import requests
-            requests.put(
-                upload_url,
-                data=feed_content.encode("utf-8"),
-                headers={"Content-Type": "text/tab-separated-values;charset=UTF-8"},
-            )
-
-            feed_response = api.create_feed(
-                body={
-                    "feedType": "POST_INVENTORY_AVAILABILITY_DATA",
-                    "marketplaceIds": [marketplace_id],
-                    "inputFeedDocumentId": feed_doc_id,
-                }
-            )
+            req.put(upload_url, data=feed_content.encode("utf-8"),
+                    headers={"Content-Type": "text/tab-separated-values;charset=UTF-8"})
+            feed_response = api.create_feed(body={
+                "feedType": "POST_INVENTORY_AVAILABILITY_DATA",
+                "marketplaceIds": [self.marketplace_id],
+                "inputFeedDocumentId": feed_doc_id,
+            })
             return {"feed_id": feed_response.payload.get("feedId"), "sku": sku, "qty": qty}
         except Exception as e:
             frappe.log_error(f"Inventory update error for SKU {sku}: {e}", "SP API")

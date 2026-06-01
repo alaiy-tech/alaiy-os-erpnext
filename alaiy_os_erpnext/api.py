@@ -268,19 +268,35 @@ def mark_dispatched(sales_order_ids, carrier, awb_number, notify_customer=True):
 
 
 @frappe.whitelist()
-def amazon_reprice(sku, new_price, marketplace_id="A21TJRUUN4KGV"):
-    """Reprice an Amazon listing via SP API patchListingsItem."""
+def amazon_get_orders(days=1):
+    """Pull recent Amazon orders via SP API."""
     from alaiy_os_erpnext.amazon.sp_api import get_sp_client
     sp = get_sp_client()
-    return sp.reprice_listing(sku=sku, price=float(new_price), marketplace_id=marketplace_id)
+    return sp.get_orders(days_ago=int(days))
 
 
 @frappe.whitelist()
-def amazon_get_account_health(marketplace_id="A21TJRUUN4KGV"):
+def amazon_reprice(sku, new_price):
+    """Reprice an Amazon listing via SP API patchListingsItem."""
+    from alaiy_os_erpnext.amazon.sp_api import get_sp_client
+    sp = get_sp_client()
+    return sp.reprice_listing(sku=sku, price=float(new_price))
+
+
+@frappe.whitelist()
+def amazon_get_account_health():
     """Get latest Amazon account health metrics."""
     from alaiy_os_erpnext.amazon.sp_api import get_sp_client
     sp = get_sp_client()
-    return sp.get_account_health(marketplace_id=marketplace_id)
+    return sp.get_account_health()
+
+
+@frappe.whitelist()
+def shopify_get_orders(limit=25):
+    """Pull recent Shopify orders via GraphQL."""
+    from alaiy_os_erpnext.shopify.graphql import ShopifyGraphQL
+    shopify = ShopifyGraphQL()
+    return shopify.get_orders(limit=int(limit))
 
 
 @frappe.whitelist()
@@ -341,7 +357,7 @@ def ask_alaiy(question):
     import re
     q = (question or "").lower()
 
-    # Reorder / stock
+    # ── Reorder / stock ─────────────────────────────────────────
     if re.search(r"reorder|stock|inventory|low", q):
         items = get_inventory_with_velocity()
         low = [i for i in items if (i.get("days_cover") or 999) <= 14]
@@ -349,10 +365,10 @@ def ask_alaiy(question):
             return {"answer": "No SKUs are below the 14-day reorder threshold right now."}
         lines = []
         for i in low:
-            lines.append(f"- {i['item_code']} - {i.get('actual_qty', 0)} units, {i.get('days_cover', '?')}d cover")
+            lines.append(f"• {i['item_code']} — {i.get('actual_qty', 0)} units, {i.get('days_cover', '?')}d cover")
         return {"answer": "SKUs needing reorder:\n" + "\n".join(lines)}
 
-    # Late shipment
+    # ── Late shipment ─────────────────────────────────────────────
     if re.search(r"late|shipment|ship today|dispatch", q):
         today = frappe.utils.today()
         orders = frappe.get_all(
@@ -364,12 +380,12 @@ def ask_alaiy(question):
         if not orders:
             return {"answer": "No orders at late-shipment risk today."}
         lines = [
-            f"- {o['name']} - {o['customer']} (due {o['delivery_date']})".replace("None", "?")
+            f"• {o['name']} — {o['customer']} (due {o['delivery_date']})".replace("None", "?")
             for o in orders
         ]
         return {"answer": f"{len(orders)} order(s) at late-shipment risk:\n" + "\n".join(lines)}
 
-    # Return rate
+    # ── Return rate ─────────────────────────────────────────────
     if re.search(r"return|refund", q):
         week_ago = frappe.utils.add_days(frappe.utils.today(), -7)
         total = frappe.db.count("Sales Order", {"transaction_date": [">=", week_ago]}) or 1
@@ -380,22 +396,22 @@ def ask_alaiy(question):
         rate = round(returned / total * 100, 1)
         return {"answer": f"Return/cancel rate this week: {rate}% ({returned} of {total} orders)."}
 
-    # Revenue
+    # ── Revenue ─────────────────────────────────────────────────
     if re.search(r"revenue|sales|today", q):
         kpi = get_kpi_summary()
         today_rev = kpi.get("revenue_today", 0)
         yest_rev = kpi.get("revenue_yesterday", 0)
         pct = round((today_rev - yest_rev) / yest_rev * 100, 1) if yest_rev else 0
-        direction = "up" if pct >= 0 else "down"
+        direction = "↑" if pct >= 0 else "↓"
         return {
             "answer": (
-                f"Today: Rs{today_rev:,.0f} ({kpi.get('orders_today', 0)} orders)\n"
-                f"Yesterday: Rs{yest_rev:,.0f}\n"
+                f"Today: ₹{today_rev:,.0f} ({kpi.get('orders_today', 0)} orders)\n"
+                f"Yesterday: ₹{yest_rev:,.0f}\n"
                 f"{direction} {abs(pct)}% vs yesterday"
             )
         }
 
-    # Account health
+    # ── Account health ───────────────────────────────────────────
     if re.search(r"health|odr|account", q):
         rows = get_account_health_latest()
         if not rows:
@@ -407,16 +423,77 @@ def ask_alaiy(question):
             val = r.get(f"metric_{i}_value")
             status = r.get(f"metric_{i}_status", "ok")
             if name and val is not None:
-                icon = "OK" if status == "ok" else "WARN"
+                icon = "✓" if status == "ok" else "⚠"
                 lines.append(f"{icon} {name}: {val:.1f}% ({status})")
         marketplace = r.get("marketplace") or "Amazon"
         return {"answer": f"Account health ({marketplace}):\n" + "\n".join(lines)}
 
-    # Generic fallback
+    # ── Generic fallback ─────────────────────────────────────────
     return {
         "answer": (
-            f'No specific data found for "{question}". '
+            f'I couldn\'t find specific data for "{question}". '
             'Try: "Which SKUs need reorder?", "Revenue today", '
             '"Late shipment risk", "Return rate", "Account health".'
         ),
     }
+
+
+@frappe.whitelist(allow_guest=True)
+def shopify_oauth_callback():
+    """
+    Shopify OAuth callback — receives ?code= redirect, exchanges for shpat_ token,
+    saves to site_config.json. Redirect URI: http://localhost:8080/api/method/alaiy_os_erpnext.api.shopify_oauth_callback
+    """
+    import urllib.request
+    import urllib.parse
+
+    code = frappe.request.args.get("code", "")
+    shop = frappe.request.args.get("shop", "altomoda-njnkghxg.myshopify.com")
+
+    if not code:
+        return {"error": "No code in request", "args": dict(frappe.request.args)}
+
+    client_id = getattr(frappe.conf, "shopify_client_id", "")
+    client_secret = getattr(frappe.conf, "shopify_client_secret", "")
+
+    post_data = urllib.parse.urlencode({
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://" + shop + "/admin/oauth/access_token",
+        data=post_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+
+    with urllib.request.urlopen(req) as r:
+        result = json.loads(r.read())
+
+    token = result.get("access_token", "")
+
+    if token:
+        site_config_path = frappe.get_site_path("site_config.json")
+        with open(site_config_path) as f:
+            cfg = json.load(f)
+        cfg["shopify_access_token"] = token
+        cfg["shopify_domain"] = shop
+        with open(site_config_path, "w") as f:
+            json.dump(cfg, f, indent=1)
+
+        frappe.local.response["type"] = "redirect"
+        frappe.local.response["location"] = (
+            "http://localhost:8888/alaiy-os-selfserve-prototype.html"
+            "?shopify_connected=1&shop=" + shop
+        )
+
+    return {"token_saved": bool(token), "shop": shop}
+
+
+@frappe.whitelist()
+def shopify_get_products(limit=50):
+    """Pull products from Shopify via GraphQL."""
+    from alaiy_os_erpnext.shopify.graphql import ShopifyGraphQL
+    shopify = ShopifyGraphQL()
+    return shopify.get_products(limit=int(limit))
