@@ -1,4 +1,5 @@
 frappe
+pypika @ git+https://github.com/frappe/pypika@2c50e6142b2d61d2d243e466fdd5dc03b3d918f2
 python-amazon-sp-api>=0.17.0
 requests>=2.31.0
 gql[requests]>=3.5.0
