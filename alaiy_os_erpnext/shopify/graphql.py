@@ -12,7 +12,7 @@ import requests
 
 class ShopifyGraphQL:
 
-    API_VERSION = "2025-01"
+    API_VERSION = "2025-04"
 
     def __init__(self):
         conf = frappe.conf
